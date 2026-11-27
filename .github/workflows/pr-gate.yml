@@ -1,0 +1,225 @@
+name: PR Merge Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Run golangci-lint
+        if: hashFiles('backend/go.mod') != ''
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: backend
+
+      - name: Setup Node.js
+        if: hashFiles('frontend/package.json') != '' || hashFiles('e2e/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Lint and typecheck frontend
+        if: hashFiles('frontend/package.json') != ''
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npx tsc --noEmit
+
+      - name: Typecheck E2E
+        if: hashFiles('e2e/package.json') != ''
+        working-directory: e2e
+        run: |
+          npm ci
+          npx tsc --noEmit
+
+      - name: Validate scripts
+        run: bash -n scripts/verify.sh
+
+  layer-1-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Backend Layer 1 unit tests
+        if: hashFiles('backend/go.mod') != ''
+        working-directory: backend
+        run: |
+          if [ -d internal/domain ]; then go test -race ./internal/domain/...; fi
+          if [ -d internal/notify ]; then go test -race ./internal/notify/...; fi
+
+      - name: Setup Node.js
+        if: hashFiles('frontend/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Frontend Layer 1 unit tests
+        if: hashFiles('frontend/package.json') != ''
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run test:unit
+
+  layer-2-component:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Backend Layer 2 component tests
+        if: hashFiles('backend/go.mod') != ''
+        working-directory: backend
+        run: |
+          if [ -d internal/api ]; then go test -race ./internal/api/...; fi
+
+  layer-3-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        if: hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Setup Node.js
+        if: hashFiles('frontend/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify OpenAPI spec has zero drift
+        if: hashFiles('backend/cmd/openapi/main.go') != ''
+        run: |
+          mkdir -p contracts
+          (cd backend && go run ./cmd/openapi -out ../contracts/openapi.json)
+          git diff --exit-code contracts/openapi.json
+
+      - name: Verify frontend schema types and runtime contract tests
+        if: hashFiles('frontend/package.json') != ''
+        run: |
+          cd frontend
+          npm ci
+          npx openapi-typescript ../contracts/openapi.json -o src/api/schema.d.ts
+          git diff --exit-code src/api/schema.d.ts
+          npm run test:contract
+
+  layer-4-integration:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Wait for DynamoDB Local
+        if: hashFiles('backend/internal/store/**/*_integration_test.go') != ''
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8000 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "DynamoDB Local did not become ready in time" >&2
+          exit 1
+
+      - name: Backend Layer 4 DynamoDB integration tests
+        if: hashFiles('backend/internal/store/**/*_integration_test.go') != ''
+        working-directory: backend
+        env:
+          TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+          AWS_REGION: us-east-1
+        run: go test -race -tags=integration ./internal/store/...
+
+  infra-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        if: hashFiles('infra/*.tf') != ''
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform fmt and validate
+        if: hashFiles('infra/*.tf') != ''
+        run: |
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra init -backend=false -input=false
+          terraform -chdir=infra validate
+
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    needs:
+      - lint-and-typecheck
+      - layer-1-unit
+      - layer-2-component
+      - layer-3-contract
+      - layer-4-integration
+      - infra-validate
+    if: always()
+    steps:
+      - name: Check required PR gate jobs
+        env:
+          LINT_RESULT: ${{ needs.lint-and-typecheck.result }}
+          UNIT_RESULT: ${{ needs.layer-1-unit.result }}
+          COMPONENT_RESULT: ${{ needs.layer-2-component.result }}
+          CONTRACT_RESULT: ${{ needs.layer-3-contract.result }}
+          INTEGRATION_RESULT: ${{ needs.layer-4-integration.result }}
+          INFRA_RESULT: ${{ needs.infra-validate.result }}
+        run: |
+          for status in "$LINT_RESULT" "$UNIT_RESULT" "$COMPONENT_RESULT" "$CONTRACT_RESULT" "$INTEGRATION_RESULT" "$INFRA_RESULT"; do
+            if [[ "$status" != "success" ]]; then
+              echo "One or more required PR gate jobs did not succeed." >&2
+              exit 1
+            fi
+          done
+          echo "All PR gate checks succeeded."

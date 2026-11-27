@@ -1,0 +1,132 @@
+name: Deploy & E2E Gate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      deploy_configured: ${{ steps.check.outputs.configured }}
+      base_url: ${{ vars.DEPLOY_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deployment configuration
+        id: check
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          BASE_URL: ${{ vars.DEPLOY_BASE_URL }}
+        run: |
+          if [[ -z "$AWS_ROLE_ARN" || -z "$BASE_URL" ]]; then
+            echo "Deployment secrets/vars (AWS_DEPLOY_ROLE_ARN, DEPLOY_BASE_URL) not configured yet; skipping deploy."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Go
+        if: steps.check.outputs.configured == 'true' && hashFiles('backend/go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build and deploy Go ARM64 Lambdas
+        if: steps.check.outputs.configured == 'true' && hashFiles('backend/cmd/lambda-api/main.go') != ''
+        env:
+          API_FUNCTION_NAME: ${{ vars.LAMBDA_API_FUNCTION_NAME }}
+          ALERTER_FUNCTION_NAME: ${{ vars.LAMBDA_ALERTER_FUNCTION_NAME }}
+        run: |
+          mkdir -p dist
+          (cd backend && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -o ../dist/api-bootstrap ./cmd/lambda-api)
+          (cd dist && cp api-bootstrap bootstrap && zip -j lambda-api.zip bootstrap && rm bootstrap)
+          aws lambda update-function-code --function-name "$API_FUNCTION_NAME" --zip-file fileb://dist/lambda-api.zip
+          aws lambda wait function-updated-v2 --function-name "$API_FUNCTION_NAME"
+
+          if [[ -f backend/cmd/lambda-alerter/main.go && -n "$ALERTER_FUNCTION_NAME" ]]; then
+            (cd backend && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -o ../dist/alerter-bootstrap ./cmd/lambda-alerter)
+            (cd dist && cp alerter-bootstrap bootstrap && zip -j lambda-alerter.zip bootstrap && rm bootstrap)
+            aws lambda update-function-code --function-name "$ALERTER_FUNCTION_NAME" --zip-file fileb://dist/lambda-alerter.zip
+            aws lambda wait function-updated-v2 --function-name "$ALERTER_FUNCTION_NAME"
+          fi
+
+      - name: Setup Node.js
+        if: steps.check.outputs.configured == 'true' && hashFiles('frontend/package.json') != '' && vars.FRONTEND_S3_BUCKET != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build and sync frontend to S3
+        if: steps.check.outputs.configured == 'true' && hashFiles('frontend/package.json') != '' && vars.FRONTEND_S3_BUCKET != ''
+        env:
+          FRONTEND_BUCKET: ${{ vars.FRONTEND_S3_BUCKET }}
+          CLOUDFRONT_DIST_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          (cd frontend && npm ci && npm run build)
+          aws s3 sync frontend/dist "s3://${FRONTEND_BUCKET}" --delete
+          if [[ -n "$CLOUDFRONT_DIST_ID" ]]; then
+            aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DIST_ID" --paths "/*"
+          fi
+
+      - name: Wait for /readyz
+        if: steps.check.outputs.configured == 'true'
+        env:
+          BASE_URL: ${{ vars.DEPLOY_BASE_URL }}
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "${BASE_URL%/}/readyz"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Deployment failed readiness check at ${BASE_URL%/}/readyz" >&2
+          exit 1
+
+  layer-5-e2e-gate:
+    needs: deploy
+    if: needs.deploy.outputs.deploy_configured == 'true' && hashFiles('e2e/package.json') != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run Layer 5 E2E tests
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: ${{ needs.deploy.outputs.base_url }}
+          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+        run: npx playwright test
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/

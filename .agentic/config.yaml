@@ -1,0 +1,43 @@
+# Agentic Workflow configuration for monitor-grow
+# Docs: https://github.com/waustinlynn/agentic-workflow/blob/main/docs/onboarding.md
+#
+# Required GitHub repository settings:
+#   - Enable "Allow auto-merge" in Settings -> General -> Pull Requests
+#   - Protect `main`: require 1 approving review (agentic-reviewer[bot]) + passing `verify` status check
+#   - Install both `agentic-coder` and `agentic-reviewer` GitHub Apps
+
+version: 1
+stack: fullstack
+
+git:
+  default_branch: main
+  branch_prefix: agent/
+  commit_style: conventional
+
+execution:
+  target: local
+  runtime: go
+  max_review_rounds: 3
+  timeout_minutes: 12
+  working_directory: .
+  setup_commands: []
+  verify_commands:
+    - bash scripts/verify.sh
+
+review:
+  wait_for_ci: true
+  auto_merge: true
+  merge_method: squash
+  extra_checklist:
+    - "Verify ports-and-adapters boundaries: API handlers depend only on domain interfaces, never DynamoDB or SNS SDK clients directly"
+    - "Confirm OpenAPI contract (contracts/openapi.json and frontend/src/api/schema.d.ts) has zero drift and no hand-written API DTOs in frontend"
+    - "Verify input validation, constant-time API key authentication, and RFC 9457 Problem Details error responses on all endpoints"
+    - "Confirm zero Docker or testcontainers dependencies in local and PR tests"
+    - "For Terraform changes: verify least-privilege IAM, no hardcoded secrets/account IDs, and serverless cost bounds (DynamoDB on-demand, ARM64 Lambdas, no NAT Gateways)"
+
+safety:
+  protected_paths:
+    - .github/workflows/**
+    - .agentic/**
+    - CODEOWNERS
+  allow_external_forks: false
