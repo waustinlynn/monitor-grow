@@ -56,7 +56,7 @@ if [[ -f "backend/go.mod" ]]; then
     tmp_openapi="$(mktemp)"
     trap 'rm -f "${tmp_openapi:-}" "${tmp_fe_schema:-}"' EXIT
     (cd backend && go run ./cmd/openapi -out "$tmp_openapi")
-    diff -u contracts/openapi.json "$tmp_openapi" || {
+    git diff --no-index --exit-code contracts/openapi.json "$tmp_openapi" || {
       echo "ERROR: contracts/openapi.json has drifted from backend OpenAPI spec. Run 'just generate-openapi'." >&2
       exit 1
     }
@@ -90,7 +90,7 @@ if [[ -f "frontend/package.json" ]]; then
     tmp_fe_schema="$(mktemp)"
     trap 'rm -f "${tmp_openapi:-}" "${tmp_fe_schema:-}"' EXIT
     (cd frontend && npx openapi-typescript ../contracts/openapi.json -o "$tmp_fe_schema")
-    diff -u frontend/src/api/schema.d.ts "$tmp_fe_schema" || {
+    git diff --no-index --exit-code frontend/src/api/schema.d.ts "$tmp_fe_schema" || {
       echo "ERROR: frontend/src/api/schema.d.ts has drifted from contracts/openapi.json. Run 'just generate-fe-types'." >&2
       exit 1
     }
