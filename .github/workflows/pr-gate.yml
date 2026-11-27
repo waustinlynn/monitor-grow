@@ -23,9 +23,9 @@ jobs:
 
       - name: Run golangci-lint
         if: hashFiles('backend/go.mod') != ''
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.15.0
           working-directory: backend
 
       - name: Setup Node.js
@@ -70,6 +70,7 @@ jobs:
         run: |
           if [ -d internal/domain ]; then go test -race ./internal/domain/...; fi
           if [ -d internal/notify ]; then go test -race ./internal/notify/...; fi
+          if [ -d internal/config ]; then go test -race ./internal/config/...; fi
 
       - name: Setup Node.js
         if: hashFiles('frontend/package.json') != ''
@@ -186,6 +187,7 @@ jobs:
         if: hashFiles('infra/*.tf') != ''
         uses: hashicorp/setup-terraform@v3
         with:
+          terraform_version: 1.17.2
           terraform_wrapper: false
 
       - name: Terraform fmt and validate

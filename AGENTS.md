@@ -64,6 +64,14 @@ Repository-specific engineering, architecture, and testing standards for automat
 
 ## Verification Commands
 
+### Worker Toolchain (`agentic-workflow` `worker-base` v0.2.0)
+The AWS Lambda `worker-base` runtime (`target: lambda`, `runtime: base`) provides:
+- **Go `1.27.4`** + `gcc` (supports `go test -race`)
+- **`golangci-lint` `2.15.0`** (**v2 config format**: `backend/.golangci.yml` MUST use `version: "2"`)
+- **Node.js `22.23.5` LTS** + `npm`
+- **Terraform `1.17.2`** + `jq`
+- **`just` `1.59.0`**
+
 Always run before finishing any task:
 
 ```bash

@@ -15,8 +15,8 @@ git:
   commit_style: conventional
 
 execution:
-  target: local
-  runtime: go
+  target: lambda
+  runtime: base
   max_review_rounds: 3
   timeout_minutes: 12
   working_directory: .

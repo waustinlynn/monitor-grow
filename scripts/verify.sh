@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Progressive local verification script for monitor-grow.
+# Progressive local & Lambda-worker verification script for monitor-grow.
 # Runs every applicable PR gate check for components that exist in the repo.
-# Keeps early scaffolding PRs green while strictly enforcing all layers as each
-# module is added.
+# Safe to run both in uncommitted workspaces (before agent commit_and_push)
+# and on clean checkouts in CI, with zero Docker dependencies.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> Running monitor-grow local verification"
+echo "==> Running monitor-grow verification"
 
 if [[ -f "backend/go.mod" ]]; then
   command -v go >/dev/null 2>&1 || {
@@ -28,13 +28,18 @@ if [[ -f "backend/go.mod" ]]; then
   fi
 
   if [[ -d "backend/internal/domain" ]]; then
-    echo "==> [Layer 1] Backend unit tests"
+    echo "==> [Layer 1] Backend domain unit tests"
     (cd backend && go test -race ./internal/domain/...)
   fi
 
   if [[ -d "backend/internal/notify" ]]; then
     echo "==> [Layer 1] Notifier unit tests"
     (cd backend && go test -race ./internal/notify/...)
+  fi
+
+  if [[ -d "backend/internal/config" ]]; then
+    echo "==> [Layer 1] Config unit tests"
+    (cd backend && go test -race ./internal/config/...)
   fi
 
   if [[ -d "backend/internal/api" ]]; then
@@ -44,11 +49,17 @@ if [[ -f "backend/go.mod" ]]; then
 
   if [[ -f "backend/cmd/openapi/main.go" ]]; then
     echo "==> [Layer 3A] OpenAPI export & zero-drift check"
-    mkdir -p contracts
-    (cd backend && go run ./cmd/openapi -out ../contracts/openapi.json)
-    if git ls-files --error-unmatch contracts/openapi.json >/dev/null 2>&1; then
-      git diff --exit-code contracts/openapi.json
+    if [[ ! -f "contracts/openapi.json" ]]; then
+      echo "ERROR: contracts/openapi.json is missing. Run 'just generate-openapi' and commit it." >&2
+      exit 1
     fi
+    tmp_openapi="$(mktemp)"
+    trap 'rm -f "${tmp_openapi:-}" "${tmp_fe_schema:-}"' EXIT
+    (cd backend && go run ./cmd/openapi -out "$tmp_openapi")
+    diff -u contracts/openapi.json "$tmp_openapi" || {
+      echo "ERROR: contracts/openapi.json has drifted from backend OpenAPI spec. Run 'just generate-openapi'." >&2
+      exit 1
+    }
   fi
 
   if [[ -n "${TEST_DYNAMODB_ENDPOINT:-}" ]] && [[ -d "backend/internal/store" ]]; then
@@ -72,10 +83,17 @@ if [[ -f "frontend/package.json" ]]; then
 
   if [[ -f "contracts/openapi.json" ]]; then
     echo "==> [Layer 3A] Frontend OpenAPI type generation & zero-drift check"
-    (cd frontend && npx openapi-typescript ../contracts/openapi.json -o src/api/schema.d.ts)
-    if git ls-files --error-unmatch frontend/src/api/schema.d.ts >/dev/null 2>&1; then
-      git diff --exit-code frontend/src/api/schema.d.ts
+    if [[ ! -f "frontend/src/api/schema.d.ts" ]]; then
+      echo "ERROR: frontend/src/api/schema.d.ts is missing. Run 'just generate-fe-types'." >&2
+      exit 1
     fi
+    tmp_fe_schema="$(mktemp)"
+    trap 'rm -f "${tmp_openapi:-}" "${tmp_fe_schema:-}"' EXIT
+    (cd frontend && npx openapi-typescript ../contracts/openapi.json -o "$tmp_fe_schema")
+    diff -u frontend/src/api/schema.d.ts "$tmp_fe_schema" || {
+      echo "ERROR: frontend/src/api/schema.d.ts has drifted from contracts/openapi.json. Run 'just generate-fe-types'." >&2
+      exit 1
+    }
   fi
 
   echo "==> [Frontend] lint & typecheck"
